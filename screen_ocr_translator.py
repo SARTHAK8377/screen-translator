@@ -59,7 +59,8 @@ HOTKEY_KEY = "t"  # used with Ctrl+Shift
 HOTKEY_LABEL = "Ctrl+Shift+T"
 OLLAMA_MODEL: Optional[str] = "llama3.2"  # set to None to always use "Key sentences"
 OLLAMA_URL = "http://localhost:11434/api/generate"
-OLLAMA_TIMEOUT_S = 60
+OLLAMA_TIMEOUT_S = 120      # CPU-only laptops can take a while, especially the first run
+OLLAMA_START_WAIT_S = 15    # how long to wait for an auto-started Ollama server
 
 UI_POLL_MS = 100
 MIN_SELECTION_PX = 5
@@ -351,15 +352,56 @@ def translate_document(text: str, src: str, tgt: str, join_lines: bool,
 # Summary (Ollama first, extractive fallback)
 # =============================================================================
 
+def _local_opener() -> urllib.request.OpenerDirector:
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}))  # never proxy localhost
+
+
+def _ollama_up() -> bool:
+    try:
+        with _local_opener().open(OLLAMA_URL.rsplit("/api/", 1)[0] + "/api/version", timeout=1):
+            return True
+    except Exception:
+        return False
+
+
+def ensure_ollama_running() -> bool:
+    """Start the Ollama server in the background if it is installed but not running."""
+    if _ollama_up():
+        return True
+    exe = shutil.which("ollama")
+    default = Path.home() / "AppData" / "Local" / "Programs" / "Ollama" / "ollama.exe"
+    if exe is None and sys.platform == "win32" and default.exists():
+        exe = str(default)
+    if exe is None:
+        return False
+    kwargs: dict[str, Any] = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL,
+                              "stderr": subprocess.DEVNULL, "close_fds": True}
+    if sys.platform == "win32":
+        kwargs["creationflags"] = 0x00000008 | 0x00000200  # DETACHED_PROCESS | NEW_PROCESS_GROUP
+    else:
+        kwargs["start_new_session"] = True
+    try:
+        subprocess.Popen([exe, "serve"], **kwargs)
+    except OSError:
+        return False
+    deadline = time.monotonic() + OLLAMA_START_WAIT_S
+    while time.monotonic() < deadline:
+        time.sleep(0.25)
+        if _ollama_up():
+            return True
+    return False
+
+
 def ollama_summary(text: str, language: str) -> Optional[str]:
-    if not OLLAMA_MODEL:
+    if not OLLAMA_MODEL or not ensure_ollama_running():
         return None
-    prompt = (f"Summarize the following text in 2-3 sentences, in {language}. "
-              f"Output only the summary.\n\n{text}")
+    prompt = (f"Summarize the following text in your own words in 2-3 sentences, written in "
+              f"{language}. Do not copy sentences from the text. Output only the summary."
+              f"\n\n{text}")
     body = json.dumps({"model": OLLAMA_MODEL, "prompt": prompt, "stream": False}).encode("utf-8")
     request = urllib.request.Request(OLLAMA_URL, data=body,
                                      headers={"Content-Type": "application/json"})
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # never proxy localhost
+    opener = _local_opener()
     try:
         with opener.open(request, timeout=OLLAMA_TIMEOUT_S) as response:
             summary = json.loads(response.read().decode("utf-8")).get("response", "").strip()
@@ -1844,8 +1886,13 @@ class App:
         if not ok:
             self._set_status("Translation unavailable.", "err")
             return
-        self._set_summary("Summarizing...", "", muted=True)
-        self._set_status("Summarizing...")
+        if OLLAMA_MODEL:
+            self._set_summary("Writing AI summary... this can take 15-60 seconds on a laptop CPU.",
+                              "", muted=True)
+            self._set_status("Writing AI summary...")
+        else:
+            self._set_summary("Summarizing...", "", muted=True)
+            self._set_status("Summarizing...")
 
         def work() -> None:
             if job != self.translate_job:
