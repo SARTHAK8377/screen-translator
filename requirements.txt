@@ -1,0 +1,9 @@
+# Tkinter ships with python.org Python (Linux: sudo apt install python3-tk).
+# easyocr pulls in PyTorch. On Linux, install the CPU build first to save ~2 GB:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+mss>=9.0
+Pillow>=9.1
+numpy>=1.24
+easyocr>=1.7
+argostranslate>=1.9
+pynput>=1.7
