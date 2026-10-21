@@ -77,6 +77,10 @@ LISTENER_PORT = 47822   # listener accepts "ping" / "stop"; also its single-inst
 LAUNCH_DEBOUNCE_S = 3.0
 AUTOSTART_NAME = "ScreenOCRTranslator"
 WINDOWS_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+# Windows' Startup-apps on/off switch for Run entries. An entry without a record here can be
+# skipped at login, so --install marks it enabled (0x02 + 11 zero bytes, as Settings writes).
+WINDOWS_STARTUP_APPROVED_KEY = r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run"
+STARTUP_ENABLED = b"\x02" + b"\x00" * 11
 LINUX_AUTOSTART_FILE = Path.home() / ".config" / "autostart" / "screen-ocr-translator.desktop"
 
 # Look and feel
@@ -103,7 +107,8 @@ LINE_GROUP_FACTOR = 0.5      # same line if centers differ < 0.5 x median box he
 PARAGRAPH_GAP_FACTOR = 1.5   # blank line if line centers differ > 1.5 x median line height
 TABLE_CELL_GAP_FACTOR = 1.0  # new table cell if horizontal gap > 1.0 x median box height
 
-DEFAULT_SOURCE = "English"
+AUTO_DETECT = "Auto-detect"
+DEFAULT_SOURCE = AUTO_DETECT
 DEFAULT_TARGET = "English"
 
 # Display name -> (EasyOCR code, Argos code)
@@ -123,6 +128,38 @@ LANGUAGES: dict[str, tuple[str, str]] = {
     "Turkish": ("tr", "tr"),
     "Urdu": ("ur", "ur"),
 }
+
+# Writing systems: EasyOCR reader languages for each, and which script each language uses.
+SCRIPT_READER_LANGS: dict[str, list[str]] = {
+    "latin": ["en", "es", "fr", "de", "pt", "it", "tr"],
+    "cyrillic": ["ru", "en"],
+    "devanagari": ["hi", "en"],
+    "arabic": ["ar", "ur", "en"],
+    "japanese": ["ja", "en"],
+    "korean": ["ko", "en"],
+    "chinese": ["ch_sim", "en"],
+}
+SCRIPT_OF_LANGUAGE: dict[str, str] = {
+    "English": "latin", "Spanish": "latin", "French": "latin", "German": "latin",
+    "Portuguese": "latin", "Italian": "latin", "Turkish": "latin", "Russian": "cyrillic",
+    "Hindi": "devanagari", "Arabic": "arabic", "Urdu": "arabic", "Japanese": "japanese",
+    "Korean": "korean", "Chinese (Simplified)": "chinese",
+}
+SCRIPT_CHAR_RANGES: dict[str, str] = {  # letters native to each script (for scoring OCR output)
+    "latin": "A-Za-zÀ-ɏ",
+    "cyrillic": "Ѐ-ӿ",
+    "devanagari": "ऀ-ॿ",
+    "arabic": "؀-ۿݐ-ݿ",
+    "japanese": "぀-ヿ一-鿿",
+    "korean": "가-힯ᄀ-ᇿ",
+    "chinese": "一-鿿",
+}
+LATIN_ACCEPT_CONFIDENCE = 0.65  # Latin read this confidently -> skip trying other scripts
+DETECT_SAMPLE_LINES = 4         # scripts compete on this many of the widest text lines
+SCRIPT_ACCEPT_SCORE = 0.45      # ends the search early (measured: right script 0.54-0.91,
+#                                 wrong scripts never above 0.20)
+NON_LATIN_TRY_ORDER = ["devanagari", "cyrillic", "chinese", "japanese", "korean", "arabic"]
+#   Arabic last: its reader is ~4x slower than the others on CPU.
 
 SENTENCE_RE = re.compile(r"[^.!?।。！？]+[.!?।。！？]*")
 CJK_RANGES = "぀-ヿ㐀-䶿一-鿿豈-﫿"
@@ -349,6 +386,121 @@ def translate_document(text: str, src: str, tgt: str, join_lines: bool,
 
 
 # =============================================================================
+# Language auto-detection (pure Python)
+# =============================================================================
+
+# Common words that are frequent in one Latin-script language and rare in the others.
+LATIN_STOPWORDS: dict[str, set[str]] = {
+    "English": {"the", "and", "of", "to", "is", "in", "that", "it", "for", "with", "was", "are",
+                "this", "you", "have", "on", "be", "not", "they", "from", "by", "or", "which"},
+    "Spanish": {"el", "la", "los", "las", "de", "que", "y", "en", "un", "una", "es", "por", "con",
+                "para", "del", "se", "no", "más", "pero", "como", "muy", "también", "está"},
+    "French": {"le", "la", "les", "de", "des", "et", "est", "un", "une", "que", "qui", "dans",
+               "pour", "pas", "sur", "au", "du", "avec", "ce", "sont", "nous", "vous", "plus"},
+    "German": {"der", "die", "das", "und", "ist", "nicht", "ein", "eine", "zu", "den", "mit",
+               "von", "sich", "auf", "für", "dem", "ich", "auch", "werden", "sind", "wird",
+               "zur", "zum", "im", "vom", "bei", "nach", "aus", "über", "oder", "aber", "wie",
+               "wenn", "noch", "nur", "kein", "wurde", "sie", "wir", "ihre", "ihr", "ab"},
+    "Portuguese": {"o", "a", "os", "as", "de", "que", "e", "do", "da", "em", "um", "uma", "para",
+                   "com", "não", "é", "por", "mais", "dos", "das", "são", "muito", "também",
+                   "ao", "aos", "nos", "na", "pelo", "pela", "seu", "sua", "você", "fica"},
+    "Italian": {"il", "lo", "la", "gli", "le", "di", "che", "e", "è", "un", "una", "per", "non",
+                "con", "del", "della", "sono", "anche", "più", "nel", "molto", "questo",
+                "al", "alla", "sulla", "nella", "dei", "nei", "delle", "questa"},
+    "Turkish": {"ve", "bir", "bu", "da", "de", "için", "ile", "çok", "ne", "gibi", "daha", "olan",
+                "var", "ama", "değil", "olarak", "kadar", "en", "her", "ise", "ben"},
+}
+# Letters that point to particular languages (weight per occurrence).
+LATIN_LETTER_HINTS: dict[str, dict[str, float]] = {
+    "ñ": {"Spanish": 3}, "¿": {"Spanish": 3}, "¡": {"Spanish": 3},
+    "ã": {"Portuguese": 3}, "õ": {"Portuguese": 3}, "ß": {"German": 3}, "ä": {"German": 2},
+    "ğ": {"Turkish": 3}, "ş": {"Turkish": 3}, "ı": {"Turkish": 3}, "œ": {"French": 3},
+    "ê": {"French": 1, "Portuguese": 1}, "î": {"French": 1.5}, "û": {"French": 1.5},
+    "ô": {"French": 1, "Portuguese": 1}, "ò": {"Italian": 2}, "ì": {"Italian": 2},
+    "ç": {"French": 1, "Portuguese": 1, "Turkish": 1}, "ü": {"German": 1, "Turkish": 1},
+    "ö": {"German": 1, "Turkish": 1}, "é": {"French": 0.6, "Spanish": 0.3, "Portuguese": 0.3},
+    "á": {"Spanish": 0.7, "Portuguese": 0.7}, "í": {"Spanish": 0.7, "Portuguese": 0.5},
+    "ó": {"Spanish": 0.7, "Portuguese": 0.5}, "ú": {"Spanish": 0.7, "Portuguese": 0.5},
+    "è": {"French": 0.6, "Italian": 0.6}, "à": {"French": 0.6, "Italian": 0.6, "Portuguese": 0.3},
+}
+# Letter patterns typical of each language; they occur inside almost every word, so even short
+# labels like "Einstellungen speichern" get a signal. Spaces mark word starts/ends.
+LATIN_NGRAMS: dict[str, dict[str, float]] = {
+    "English": {"th": 1.0, "wh": 1.2, "ing": 1.5, "ght": 2, "ly ": 0.8, "ow": 0.5, "ea": 0.4,
+                "you": 1, "sh": 0.6, "y ": 0.6},
+    "German": {"sch": 1.5, "cht": 2, "ung": 1.5, "eit": 1.2, "ich": 1, "ein": 0.8, "ei": 0.5,
+               "ie": 0.4, "tz": 1.5, "chen": 1, "ck": 0.5, "en ": 0.4, "er ": 0.3, "k": 0.25},
+    "Spanish": {"ción": 3, "ión": 1, "ll": 0.5, "rr": 0.8, "ía": 1.2, "ado": 0.8, "ido": 0.6,
+                "os ": 0.6, "dad": 1.5, "mente": 1.2, "ar ": 0.6},
+    "French": {"eau": 2, "oi": 0.8, "ou": 0.4, "qu": 0.5, "ent ": 0.8, "aux ": 1.5, "ais": 0.8,
+               "ez ": 1.5, " l'": 0.8, " d'": 1, "qu'": 1.5, "ètre": 1.5, "eur ": 1, "ée": 1.5},
+    "Portuguese": {"ção": 3, "ões": 3, "ão": 2, "nh": 1.2, "lh": 1.2, "em ": 0.5, "do ": 0.4,
+                   "ade ": 1, "inho": 1.5},
+    "Italian": {"zion": 2.5, "ione": 1, "gli": 1.5, "gn": 0.8, "cch": 1.5, "zz": 1.2, "tt": 0.5,
+                "oni ": 0.8, "che ": 0.6, "iche ": 1.2, "zi": 0.4, "gg": 1.2},
+    "Turkish": {"lar": 1.5, "ler": 1.5, "iyor": 2, "mak": 0.8, "dir": 0.5},
+}
+LATIN_MIN_SCORE = 0.8  # weaker evidence than this -> English
+URDU_ONLY_LETTERS = set("ٹڈڑںےۓھہگچپژک")  # used in Urdu but not in Arabic
+KANA_RE = re.compile("[぀-ヿ]")
+LATIN_WORD_RE = re.compile(r"[^\W\d_]+")
+
+
+def detect_latin_language(text: str) -> str:
+    """Guess which Latin-script language text is in; English when there are no clues."""
+    scores = {lang: 0.0 for lang in LATIN_STOPWORDS}
+    for word in LATIN_WORD_RE.findall(text.lower()):
+        for lang, words in LATIN_STOPWORDS.items():
+            if word in words:
+                scores[lang] += 1
+    for char in text.lower():
+        for lang, weight in LATIN_LETTER_HINTS.get(char, {}).items():
+            scores[lang] += weight
+    padded = " " + re.sub(r"[^\w']+", " ", text.lower()).strip() + " "
+    for lang, grams in LATIN_NGRAMS.items():
+        scores[lang] += sum(weight * padded.count(gram) for gram, weight in grams.items())
+    best = max(scores, key=lambda lang: scores[lang])
+    return best if scores[best] >= LATIN_MIN_SCORE else "English"
+
+
+def script_score(script: str, text: str, confidence: float) -> float:
+    """OCR confidence scaled by how much of the output is letters of that script."""
+    letters = [c for c in text if c.isalpha()]
+    if not letters:
+        return 0.0
+    native = re.findall(f"[{SCRIPT_CHAR_RANGES[script]}]", "".join(letters))
+    return confidence * len(native) / len(letters)
+
+
+def choose_script(candidates: dict[str, tuple[str, float]]) -> str:
+    """Pick the writing system whose reader produced the most confident native output.
+    candidates: script -> (recognized text, mean confidence)."""
+    best = max(candidates, key=lambda s: script_score(s, *candidates[s]))
+    japanese = candidates.get("japanese")
+    if best == "chinese" and japanese and len(KANA_RE.findall(japanese[0])) >= 2:
+        return "japanese"  # kanji look alike; kana only occur in Japanese
+    return best
+
+
+def language_for_script(script: str, text: str) -> str:
+    """Map a detected writing system (plus the text read with it) to a language name."""
+    if script == "latin":
+        return detect_latin_language(text)
+    if script == "arabic":
+        return "Urdu" if any(c in URDU_ONLY_LETTERS for c in text) else "Arabic"
+    if script == "japanese":
+        return "Japanese" if KANA_RE.search(text) else "Chinese (Simplified)"
+    return {"cyrillic": "Russian", "devanagari": "Hindi", "korean": "Korean",
+            "chinese": "Chinese (Simplified)"}[script]
+
+
+def mean_confidence(results: EasyOcrResult) -> float:
+    """Confidence averaged over characters, so long words count more than stray marks."""
+    total = sum(len(text) for _, text, _ in results)
+    return sum(conf * len(text) for _, text, conf in results) / total if total else 0.0
+
+
+# =============================================================================
 # Summary (Ollama first, extractive fallback)
 # =============================================================================
 
@@ -432,30 +584,79 @@ def cuda_available() -> bool:
 
 
 class OcrEngine:
+    """One EasyOCR reader per writing system, loaded lazily. The Latin reader also owns the
+    text-box detector; the others only recognize text inside boxes it found."""
+
     def __init__(self) -> None:
         self._readers: dict[str, Any] = {}
         self._lock = threading.Lock()
 
-    def is_loaded(self, code: str) -> bool:
-        return code in self._readers
+    def is_loaded(self, script: str) -> bool:
+        return script in self._readers
 
-    def _reader(self, code: str) -> Any:
+    def _reader(self, script: str) -> Any:
         with self._lock:
-            if code not in self._readers:
+            if script not in self._readers:
                 import easyocr
-                langs = ["en"] if code == "en" else [code, "en"]
-                self._readers[code] = easyocr.Reader(langs, gpu=cuda_available(), verbose=False)
-            return self._readers[code]
+                self._readers[script] = easyocr.Reader(
+                    SCRIPT_READER_LANGS[script], gpu=cuda_available(), verbose=False,
+                    detector=script == "latin")
+            return self._readers[script]
 
-    def read(self, image: PILImage, code: str) -> tuple[str, Optional[list[list[str]]]]:
+    @staticmethod
+    def _prepare(image: PILImage) -> Any:
         import numpy as np
         from PIL import Image
 
         img = image.convert("RGB")
         if img.height < UPSCALE_BELOW_PX:
             img = img.resize((img.width * 2, img.height * 2), Image.Resampling.LANCZOS)
-        results = self._reader(code).readtext(np.asarray(img), min_size=OCR_MIN_BOX_PX)
-        return reconstruct(results)
+        return np.asarray(img)
+
+    def _detect(self, pixels: Any) -> tuple[list, list]:
+        horizontal, free = self._reader("latin").detect(pixels, min_size=OCR_MIN_BOX_PX)
+        return horizontal[0], free[0]
+
+    def _recognize(self, script: str, pixels: Any, boxes: tuple[list, list]) -> EasyOcrResult:
+        from easyocr.utils import reformat_input
+        _, grey = reformat_input(pixels)
+        return self._reader(script).recognize(grey, horizontal_list=boxes[0], free_list=boxes[1])
+
+    def read(self, image: PILImage, language: str) -> tuple[str, Optional[list[list[str]]]]:
+        pixels = self._prepare(image)
+        boxes = self._detect(pixels)
+        if not boxes[0] and not boxes[1]:
+            return "", None
+        return reconstruct(self._recognize(SCRIPT_OF_LANGUAGE[language], pixels, boxes))
+
+    def read_auto(self, image: PILImage, status: StatusFn
+                  ) -> tuple[str, Optional[list[list[str]]], Optional[str]]:
+        """Read text in an unknown language. Returns (text, table, detected language name)."""
+        pixels = self._prepare(image)
+        boxes = self._detect(pixels)
+        if not boxes[0] and not boxes[1]:
+            return "", None, None
+        results = {"latin": self._recognize("latin", pixels, boxes)}
+        latin_text = " ".join(t for _, t, _ in results["latin"])
+        script = "latin"
+        if script_score("latin", latin_text, mean_confidence(results["latin"])) < LATIN_ACCEPT_CONFIDENCE:
+            # Not clearly Latin: every script competes on a few lines, the winner reads them all.
+            sample = (sorted(boxes[0], key=lambda b: b[1] - b[0], reverse=True)[:DETECT_SAMPLE_LINES],
+                      boxes[1][:DETECT_SAMPLE_LINES])
+            candidates = {"latin": (latin_text, mean_confidence(results["latin"]))}
+            for name in NON_LATIN_TRY_ORDER:  # cheapest/likeliest first; stop once one is sure
+                if not self.is_loaded(name):
+                    status(f"Detecting language... loading the {name} reader (first time only)")
+                read = self._recognize(name, pixels, sample)
+                candidates[name] = (" ".join(t for _, t, _ in read), mean_confidence(read))
+                best = max(script_score(n, *c) for n, c in candidates.items() if n != "latin")
+                if name != "chinese" and best >= SCRIPT_ACCEPT_SCORE:
+                    break  # (never right after Chinese: Japanese, tried next, may own the kanji)
+            script = choose_script(candidates)
+            if script not in results:
+                results[script] = self._recognize(script, pixels, boxes)
+        text, table = reconstruct(results[script])
+        return text, table, language_for_script(script, text)
 
 
 # =============================================================================
@@ -467,9 +668,19 @@ class PackNotFoundError(Exception):
 
 
 class ArgosTranslator:
+    """Locks are per language pair, so a slow pack download (100-300 MB) only blocks work that
+    needs that same pack; translating with another, installed pair goes ahead meanwhile."""
+
     def __init__(self) -> None:
-        self._lock = threading.Lock()
+        self._guard = threading.Lock()          # protects _pair_locks
+        self._pair_locks: dict[tuple[str, str], threading.Lock] = {}
+        self._index_lock = threading.Lock()
         self._index_updated = False
+        self._translate_lock = threading.Lock()  # one translation at a time (CPU-bound anyway)
+
+    def _lock_for(self, pair: tuple[str, str]) -> threading.Lock:
+        with self._guard:
+            return self._pair_locks.setdefault(pair, threading.Lock())
 
     @staticmethod
     def _installed(a: str, b: str) -> bool:
@@ -480,25 +691,26 @@ class ArgosTranslator:
         return a in langs and b in langs and langs[a].get_translation(langs[b]) is not None
 
     def ensure_pairs(self, pairs: list[tuple[str, str]], status: StatusFn) -> None:
-        with self._lock:
-            for a, b in pairs:
+        for a, b in pairs:
+            with self._lock_for((a, b)):
                 if self._installed(a, b):
                     continue
                 import argostranslate.package as pkg
-                status(f"Downloading {a}->{b} pack...")
-                if not self._index_updated:
-                    pkg.update_package_index()
-                    self._index_updated = True
+                status(f"Downloading the {a}->{b} translation pack (first time only, 100-300 MB)...")
+                with self._index_lock:
+                    if not self._index_updated:
+                        pkg.update_package_index()
+                        self._index_updated = True
                 match = next((p for p in pkg.get_available_packages()
                               if p.from_code == a and p.to_code == b), None)
                 if match is None:
                     raise PackNotFoundError(f"No offline translation pack exists for {a} -> {b}.")
                 pkg.install_from_path(match.download())
 
-    @staticmethod
-    def translate(text: str, a: str, b: str) -> str:
+    def translate(self, text: str, a: str, b: str) -> str:
         import argostranslate.translate as tr
-        return tr.translate(text, a, b)
+        with self._translate_lock:
+            return tr.translate(text, a, b)
 
 
 # =============================================================================
@@ -730,6 +942,9 @@ def install_autostart() -> int:
         import winreg
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, WINDOWS_RUN_KEY, 0, winreg.KEY_SET_VALUE) as key:
             winreg.SetValueEx(key, AUTOSTART_NAME, 0, winreg.REG_SZ, _autostart_command())
+        with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, WINDOWS_STARTUP_APPROVED_KEY, 0,
+                                winreg.KEY_SET_VALUE) as key:
+            winreg.SetValueEx(key, AUTOSTART_NAME, 0, winreg.REG_BINARY, STARTUP_ENABLED)
     else:
         LINUX_AUTOSTART_FILE.parent.mkdir(parents=True, exist_ok=True)
         LINUX_AUTOSTART_FILE.write_text(
@@ -745,12 +960,13 @@ def install_autostart() -> int:
 def uninstall_autostart() -> int:
     if sys.platform == "win32":
         import winreg
-        try:
-            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, WINDOWS_RUN_KEY, 0,
-                                winreg.KEY_SET_VALUE) as key:
-                winreg.DeleteValue(key, AUTOSTART_NAME)
-        except FileNotFoundError:
-            pass
+        for key_path in (WINDOWS_RUN_KEY, WINDOWS_STARTUP_APPROVED_KEY):
+            try:
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0,
+                                    winreg.KEY_SET_VALUE) as key:
+                    winreg.DeleteValue(key, AUTOSTART_NAME)
+            except FileNotFoundError:
+                pass
     else:
         LINUX_AUTOSTART_FILE.unlink(missing_ok=True)
     stopped = send_command(LISTENER_PORT, "stop")
@@ -1365,6 +1581,7 @@ class App:
         self.ocr_job = 0
         self.translate_job = 0
         self.original_placeholder = False  # Original box shows a hint, not OCR text
+        self.detected_source: Optional[str] = None  # language found by Auto-detect
         self.thumbnail_ref: Any = None
         self.hotkey: Any = None
         self._flash_text: dict[int, str] = {}
@@ -1372,7 +1589,20 @@ class App:
         self._build_ui()
         if server is not None:
             threading.Thread(target=self._serve, args=(server,), daemon=True).start()
+        self._prewarm()
         root.after(UI_POLL_MS, self._poll)
+
+    def _prewarm(self) -> None:
+        """Load the OCR model and translation engine (~15-25 s on a laptop CPU) in the
+        background at startup, so they're ready by the time the user finishes selecting."""
+        def warm_translation() -> None:
+            try:
+                import argostranslate.translate  # noqa: F401  (heavy import, cached afterwards)
+            except Exception:
+                traceback.print_exc()
+
+        threading.Thread(target=warm_translation, name="prewarm-translate", daemon=True).start()
+        self.heavy.submit(lambda: self.ocr._reader("latin"))  # first in the OCR queue
 
     # ---- UI construction -----------------------------------------------------
 
@@ -1465,18 +1695,22 @@ class App:
         self.target_var = tk.StringVar(value=DEFAULT_TARGET)
         self.join_var = tk.BooleanVar(value=True)
 
-        def labeled(parent: tk.Frame, label: str, var: tk.StringVar,
-                    command: Callable[[], None]) -> tk.Frame:
+        def labeled(parent: tk.Frame, label: str, var: tk.StringVar, values: Sequence[str],
+                    command: Callable[[], None]) -> tuple[tk.Frame, tk.Label]:
             frame = tk.Frame(parent, bg=t["card"])
-            tk.Label(frame, text=label, bg=t["card"], fg=t["muted"],
-                     font=(FONT_FAMILY, 8, "bold")).pack(anchor="w", padx=2)
-            Field(frame, var, LANGUAGES, command).pack(anchor="w", pady=(5, 0))
-            return frame
+            caption = tk.Label(frame, text=label, bg=t["card"], fg=t["muted"],
+                               font=(FONT_FAMILY, 8, "bold"))
+            caption.pack(anchor="w", padx=2)
+            Field(frame, var, values, command).pack(anchor="w", pady=(5, 0))
+            return frame, caption
 
-        labeled(body, "TEXT IN IMAGE", self.source_var, self.request_ocr).pack(side="left")
+        frame, self.source_caption = labeled(body, "TEXT IN IMAGE", self.source_var,
+                                             [AUTO_DETECT, *LANGUAGES], self.request_ocr)
+        frame.pack(side="left")
         tk.Label(body, text="➜", bg=t["card"], fg=t["link"],
                  font=(FONT_FAMILY, 16)).pack(side="left", padx=8, pady=(20, 0))
-        labeled(body, "TRANSLATE TO", self.target_var, self.request_translation).pack(side="left")
+        labeled(body, "TRANSLATE TO", self.target_var, list(LANGUAGES),
+                self.request_translation)[0].pack(side="left")
         PillButton(body, "↻  Translate again", self.request_translation, variant="soft",
                    size=10, height=40, padx=16).pack(side="right", pady=(20, 0))
         toggle_row = tk.Frame(body, bg=t["card"])
@@ -1801,27 +2035,32 @@ class App:
         self.ocr_job += 1
         job = self.ocr_job
         name = self.source_var.get()
-        code = LANGUAGES[name][0]
+        auto = name == AUTO_DETECT
+        script = "latin" if auto else SCRIPT_OF_LANGUAGE[name]
         image = self.screenshot
-        loading = "" if self.ocr.is_loaded(code) else "\nThe first capture also loads the OCR model."
+        self._set_detected(None)
+        loading = "" if self.ocr.is_loaded(script) else "\nThe first capture also loads the OCR model."
         self._set_original_placeholder(f"Reading text from the image... please wait.{loading}")
         self._set_text(self.translation_text, "Waiting for the text...", muted=True)
         self._set_summary("", "")
         self._set_table(None)
-        self._set_status("Reading text...")
+        self._set_status("Detecting language and reading text..." if auto else "Reading text...")
 
         def work() -> None:
             if job != self.ocr_job:
                 return
-            if not self.ocr.is_loaded(code):
-                self.status(f"Loading OCR model ({name})... first use downloads it")
+            if not self.ocr.is_loaded("latin") or not self.ocr.is_loaded(script):
+                self.status("Loading OCR model... first use downloads it")
             try:
-                text, table = self.ocr.read(image, code)
+                if auto:
+                    text, table, detected = self.ocr.read_auto(image, self.status)
+                else:
+                    (text, table), detected = self.ocr.read(image, name), None
             except Exception as exc:
                 message = f"OCR failed: {exc}"
                 self.post(lambda: self._ocr_failed(job, message))
                 return
-            self.post(lambda: self._ocr_done(job, text, table))
+            self.post(lambda: self._ocr_done(job, text, table, detected))
 
         self.heavy.submit(work)
 
@@ -1831,9 +2070,24 @@ class App:
             self._set_text(self.translation_text, f"⚠ {message}")
             self._set_status(message, "err")
 
-    def _ocr_done(self, job: int, text: str, table: Optional[list[list[str]]]) -> None:
+    def _set_detected(self, language: Optional[str]) -> None:
+        """Remember the auto-detected language and show it above the Text in image picker."""
+        self.detected_source = language
+        if language:
+            short = language.split(" (")[0].upper()  # fits the column: "DETECTED: PORTUGUESE"
+            self.source_caption.configure(text=f"DETECTED: {short}", fg=THEME["link"])
+        else:
+            self.source_caption.configure(text="TEXT IN IMAGE", fg=THEME["muted"])
+
+    def _source_language(self) -> Optional[str]:
+        name = self.source_var.get()
+        return self.detected_source if name == AUTO_DETECT else name
+
+    def _ocr_done(self, job: int, text: str, table: Optional[list[list[str]]],
+                  detected: Optional[str] = None) -> None:
         if job != self.ocr_job:
             return
+        self._set_detected(detected)
         self._set_table(table)
         if not text.strip():
             self._set_original_placeholder("No text found in this selection.")
@@ -1845,12 +2099,13 @@ class App:
         self.request_translation()
 
     def request_translation(self) -> None:
-        if self.original_placeholder:  # nothing real to translate yet
+        source = self._source_language()
+        if self.original_placeholder or source is None:  # nothing real to translate yet
             return
         self.translate_job += 1
         job = self.translate_job
         text = self.original_text.get("1.0", "end-1c")
-        src = LANGUAGES[self.source_var.get()][1]
+        src = LANGUAGES[source][1]
         target_name = self.target_var.get()
         tgt = LANGUAGES[target_name][1]
         join_lines = self.join_var.get()
@@ -1865,8 +2120,18 @@ class App:
             if job != self.translate_job:
                 return
             ok = False
+
+            def pack_status(message: str) -> None:  # explain big downloads in the Translation box
+                hint = ("\n\nWrong language? Pick the right one under 'Text in image' — "
+                        "that translates right away; this download keeps going in the background.")
+                self.status(message)
+                self.post(lambda: job == self.translate_job and self._set_text(
+                    self.translation_text, message + hint, muted=True))
+
             try:
-                self.translator.ensure_pairs(required_pairs(src, tgt), self.status)
+                self.translator.ensure_pairs(required_pairs(src, tgt), pack_status)
+                if job != self.translate_job:
+                    return  # superseded while the pack downloaded
                 self.status("Translating...")
                 result = translate_document(text, src, tgt, join_lines, self.translator.translate)
                 ok = True
@@ -1877,7 +2142,9 @@ class App:
                           "The first use of a language pair needs internet to download its pack.")
             self.post(lambda: self._translation_done(job, result, ok, target_name))
 
-        self.heavy.submit(work)
+        # Own thread, not the OCR queue: a pack download must never hold up re-reading the
+        # image or translating with another language (stale jobs are dropped by job id).
+        threading.Thread(target=work, name="translate", daemon=True).start()
 
     def _translation_done(self, job: int, result: str, ok: bool, language: str) -> None:
         if job != self.translate_job:
@@ -2106,6 +2373,60 @@ def run_selftest() -> int:
     # 7. Language table.
     check("language table: 14 languages, Chinese = ch_sim/zh",
           len(LANGUAGES) == 14 and LANGUAGES["Chinese (Simplified)"] == ("ch_sim", "zh"))
+    check("every language has a writing system with a reader",
+          all(SCRIPT_OF_LANGUAGE.get(n) in SCRIPT_READER_LANGS for n in LANGUAGES))
+    check("auto-detect tries every non-Latin script, Japanese right after Chinese",
+          sorted(NON_LATIN_TRY_ORDER) == sorted(set(SCRIPT_READER_LANGS) - {"latin"})
+          and NON_LATIN_TRY_ORDER.index("japanese") == NON_LATIN_TRY_ORDER.index("chinese") + 1)
+
+    # 8. Auto-detect: Latin-script languages from paragraphs.
+    paragraphs = {
+        "English": "The weather is nice today and the children are playing in the park with their dog.",
+        "Spanish": "El tiempo está muy bien hoy y los niños juegan en el parque con su perro.",
+        "French": "Le temps est très beau aujourd'hui et les enfants jouent dans le parc avec leur chien.",
+        "German": "Das Wetter ist heute sehr schön und die Kinder spielen mit ihrem Hund im Park.",
+        "Portuguese": "O tempo está muito bom hoje e as crianças estão brincando no parque com o cão.",
+        "Italian": "Il tempo è molto bello oggi e i bambini giocano nel parco con il loro cane.",
+        "Turkish": "Bugün hava çok güzel ve çocuklar köpekleriyle birlikte parkta oynuyorlar.",
+    }
+    wrong = {lang: detect_latin_language(p) for lang, p in paragraphs.items()
+             if detect_latin_language(p) != lang}
+    check("auto-detect: 7 Latin-script languages from a sentence each", not wrong, wrong)
+    shorts = {"Thank you very much for the help": "English", "¿Dónde está la estación?": "Spanish",
+              "Straße gesperrt": "German", "Hoşgeldiniz, değil mi?": "Turkish"}
+    wrong = {t: detect_latin_language(t) for t, lang in shorts.items()
+             if detect_latin_language(t) != lang}
+    check("auto-detect: short phrases with telltale words/letters", not wrong, wrong)
+    check("auto-detect: no clues falls back to English", detect_latin_language("OK 2024") == "English")
+    german_labels = ["Einstellungen speichern", "Abbrechen", "Weiter zur Kasse",
+                     "Wetterbericht Montag: Regen, Wind, Temperaturen bis 12 Grad",
+                     "Kostenloser Versand ab 50 Euro", "Vielen Dank für Ihren Einkauf"]
+    wrong = {t: detect_latin_language(t) for t in german_labels
+             if detect_latin_language(t) != "German"}
+    check("auto-detect: short German labels/headlines (once misread as Spanish)", not wrong, wrong)
+
+    # 9. Auto-detect: script -> language, and choosing a script from competing OCR outputs.
+    check("auto-detect: Urdu vs Arabic by Urdu-only letters",
+          language_for_script("arabic", "یہ ایک کتاب ہے") == "Urdu"
+          and language_for_script("arabic", "هذا كتاب جميل") == "Arabic")
+    check("auto-detect: Japanese (kana) vs Chinese (no kana)",
+          language_for_script("japanese", "これは本です") == "Japanese"
+          and language_for_script("japanese", "这是一本书") == "Chinese (Simplified)")
+    check("auto-detect: other scripts map to their language",
+          [language_for_script(s, "") for s in ("cyrillic", "devanagari", "korean")]
+          == ["Russian", "Hindi", "Korean"])
+    hindi_page = {"latin": ("Ya ek kitab hai", 0.21), "devanagari": ("यह एक किताब है", 0.88),
+                  "cyrillic": ("уа ек", 0.15), "arabic": ("یه", 0.12)}
+    check("choose_script: confident native output wins (Hindi page)",
+          choose_script(hindi_page) == "devanagari", choose_script(hindi_page))
+    english_seen_by_cjk = {"latin": ("Hello world", 0.62), "chinese": ("Hello world", 0.95)}
+    check("choose_script: Latin letters from a CJK reader don't count as Chinese",
+          choose_script(english_seen_by_cjk) == "latin", choose_script(english_seen_by_cjk))
+    japanese_page = {"chinese": ("私は学生です", 0.80), "japanese": ("私は学生です", 0.78)}
+    check("choose_script: kana make it Japanese even if the Chinese reader scored higher",
+          choose_script(japanese_page) == "japanese", choose_script(japanese_page))
+    check("mean_confidence weights by text length",
+          abs(mean_confidence([([], "aaaa", 1.0), ([], "b", 0.0)]) - 0.8) < 1e-9)
 
     print(f"\n{'ALL TESTS PASSED' if not failures else f'{failures} TEST(S) FAILED'}")
     return 1 if failures else 0

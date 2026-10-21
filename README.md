@@ -70,6 +70,7 @@ Set `OLLAMA_MODEL = None` at the top of the script to always use the built-in su
 - **Black capture** — fullscreen games and DRM video players can't be captured; use windowed mode.
 - **Slow first capture** — the OCR model is loading/downloading; later captures are much faster.
 - **Hotkey does nothing** — when an app running as administrator is focused, Windows blocks the hotkey.
+- **Hotkey stops working after a restart** — open Settings → Apps → Startup and make sure **pythonw** (Screen OCR Translator) is switched **On**, or run `--install` again.
 - **Logs** — `%TEMP%\screen_ocr_translator.log`
 - **Linux** — the global hotkey needs X11 (not Wayland); Copy image needs `xclip` or `wl-clipboard`.
 
